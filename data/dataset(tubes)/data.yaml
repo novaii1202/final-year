@@ -1,0 +1,12 @@
+
+path: C:/Users/Asus/OneDrive/Desktop/CO6KA/ml-main/data/dataset(tubes) 
+train: images/train
+val: images/val
+
+names:
+  0: 'valbet'
+  1: 'araldite'
+  2: 'beutiful-n'
+  3: 'dk gel'
+  4: 'silverkant'
+  5: 'cani-maks'
