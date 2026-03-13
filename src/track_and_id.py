@@ -12,6 +12,19 @@ import torch
 from ultralytics import YOLO
 
 
+def _normalize_name(s: str) -> str:
+    """Lowercase and strip spaces/specials for stable name comparison."""
+    return (
+        s.strip()
+        .lower()
+        .replace(" ", "")
+        .replace("-", "")
+        .replace("_", "")
+        .replace("(", "")
+        .replace(")", "")
+    )
+
+
 # ─────────────────────────────────────────────────────
 # Threaded Video Capture (important for Raspberry Pi)
 # ─────────────────────────────────────────────────────
@@ -102,9 +115,9 @@ def load_valid_classes(data_dir: Path):
 # ─────────────────────────────────────────────────────
 def run_system(source_input,
                imgsz=320,
-               min_conf=0.6,
+               min_conf=0.85,
                frame_skip=2,
-               min_box_area=2000,
+               min_box_area=4000,
                nms_threshold=0.7,
                dedupe=False,
                debug=False,
@@ -140,6 +153,15 @@ def run_system(source_input,
 
     # ───── Load valid classes ─────
     valid_classes = load_valid_classes(base_dir / "data" / "dataset(tubes)")
+    normalized_valid = {_normalize_name(c) for c in valid_classes}
+
+    # Map model label variants to canonical class names from classes.txt
+    alias_map = {
+        # Model label '(Valbet)' → classes.txt 'valbet'
+        "valbet": "valbet",
+        # Model label 'S K Kant' → classes.txt 'silverkant'
+        "skkant": "silverkant",
+    }
 
     db_path = base_dir / "data/inspections.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -214,9 +236,12 @@ def run_system(source_input,
             for box, cls, conf, track_id in zip(boxes, clss, confs, track_ids):
 
                 x1, y1, x2, y2 = box
-                brand_name = model.names[int(cls)].lower()
 
-                if brand_name not in valid_classes:
+                raw_name = model.names[int(cls)]
+                norm_model_name = _normalize_name(raw_name)
+                # Resolve to canonical label if we know an alias
+                canonical = alias_map.get(norm_model_name, raw_name.lower())
+                if _normalize_name(canonical) not in normalized_valid:
                     continue
 
                 area = (x2 - x1) * (y2 - y1)
@@ -226,14 +251,14 @@ def run_system(source_input,
 
                 x1, y1, x2, y2 = map(int, [x1, y1, x2, y2])
 
-                detections.append((brand_name, conf, (x1, y1, x2, y2), track_id))
+                detections.append((canonical, conf, (x1, y1, x2, y2), track_id))
 
                 if not headless:
 
                     # Yellow box around detected tube
                     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
-                    label = f"ID:{track_id} {brand_name}"
+                    label = f"ID:{track_id} {canonical}"
 
                     # Yellow label text
                     cv2.putText(frame,
@@ -248,8 +273,12 @@ def run_system(source_input,
         if detections:
 
             names = [d[0] for d in detections]
+            track_ids = [d[3] for d in detections]
 
-            print(f"Detected Tube: {', '.join(names)} | Total: {len(names)}")
+            unique_ids = {tid for tid in track_ids if tid != -1}
+            total_tubes = len(unique_ids) if unique_ids else len(detections)
+
+            print(f"Detected Tube: {', '.join(names)} | Total tubes: {total_tubes}")
 
             for brand_name, conf, _, track_id in detections:
 
@@ -326,8 +355,8 @@ if __name__ == '__main__':
 
     parser.add_argument("--source", type=str, default="0")
     parser.add_argument("--imgsz", type=int, default=320)
-    parser.add_argument("--min-conf", type=float, default=0.6)
-    parser.add_argument("--min-area", type=int, default=2000)
+    parser.add_argument("--min-conf", type=float, default=0.85)
+    parser.add_argument("--min-area", type=int, default=4000)
     parser.add_argument("--nms-thresh", type=float, default=0.7)
     parser.add_argument("--skip", type=int, default=2)
     parser.add_argument("--dedupe", action="store_true")
