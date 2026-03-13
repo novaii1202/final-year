@@ -144,6 +144,9 @@ def run_system(source_input,
     db_path = base_dir / "data/inspections.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # Text log file for every detected tube
+    log_file = base_dir / "data" / "detections.log"
+
     conn = setup_db(db_path)
 
     # ───── Camera setup ─────
@@ -227,16 +230,18 @@ def run_system(source_input,
 
                 if not headless:
 
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                    # Yellow box around detected tube
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 255), 2)
 
                     label = f"ID:{track_id} {brand_name}"
 
+                    # Yellow label text
                     cv2.putText(frame,
                                 label,
                                 (x1, y1 - 10),
                                 cv2.FONT_HERSHEY_SIMPLEX,
                                 0.6,
-                                (0, 255, 0),
+                                (0, 255, 255),
                                 2)
 
         # ───── Logging ─────
@@ -261,7 +266,16 @@ def run_system(source_input,
 
                 uuid_code = log_inspection(conn, track_id, brand_name, conf)
 
-                print(f"Logged to DB: {brand_name} | Confidence: {conf:.2f}")
+                # Append to plain-text log so every detection is recorded
+                timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                try:
+                    with open(log_file, "a", encoding="utf-8") as lf:
+                        lf.write(f"{timestamp},track={track_id},tube={brand_name},conf={conf:.2f},uuid={uuid_code}\n")
+                except Exception:
+                    # Avoid breaking the main loop if logging fails
+                    pass
+
+                print(f"Logged to DB and file: {brand_name} | Confidence: {conf:.2f}")
 
         # ───── FPS counter ─────
         fps_counter += 1

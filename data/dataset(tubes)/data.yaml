@@ -1,7 +1,7 @@
 
-path: C:/Users/Asus/OneDrive/Desktop/CO6KA/ml-main/data/dataset(tubes) 
+path: D:/final-year/data/dataset(tubes) 
 train: images/train
-val: images/val
+val: images
 
 names:
   0: 'valbet'
