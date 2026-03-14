@@ -12,54 +12,62 @@ def load_classes(classes_path: Path):
     return lines
 
 
-def make_label_file(label_path: Path, class_id: int):
-    # If the image contains a single object (whole image), use full-image box.
-    # Format: class x_center y_center width height (normalized)
+def make_label_file(label_path: Path, class_id: int, boxes=None, img_w=640, img_h=480):
+    """
+    Writes a YOLO label file.
+    If boxes is None, creates a full-frame box.
+    boxes should be a list of [x1, y1, x2, y2, cls] in pixel coordinates.
+    """
     label_path.parent.mkdir(parents=True, exist_ok=True)
     with open(label_path, "w", encoding="utf-8") as f:
-        f.write(f"{class_id} 0.5 0.5 1.0 1.0\n")
+        if boxes:
+            for b in boxes:
+                # b = [x1, y1, x2, y2, cls]
+                bw = max(1, b[2] - b[0])
+                bh = max(1, b[3] - b[1])
+                xc = b[0] + bw / 2
+                yc = b[1] + bh / 2
+                # Normalize
+                f.write(f"{b[4]} {xc/img_w:.6f} {yc/img_h:.6f} {bw/img_w:.6f} {bh/img_h:.6f}\n")
+        else:
+            # Fallback to full-frame box
+            f.write(f"{class_id} 0.5 0.5 1.0 1.0\n")
 
 
-def collect_image_paths(images_dir: Path):
-    # Accept common image extensions
-    exts = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+def load_annotations(dataset_path: Path):
+    """Try to find and load _annotations.txt or similar."""
+    ann_file = dataset_path / "images" / "train" / "_annotations.txt"
+    if not ann_file.exists():
+        ann_file = dataset_path / "_annotations.txt"
+    
+    if not ann_file.exists():
+        return {}
 
-    # Ignore pre-existing train/val splits to avoid double-processing
-    ignore_folders = {"train", "val"}
-
-    paths = []
-    for p in images_dir.rglob("*"):
-        if not p.is_file() or p.suffix.lower() not in exts:
-            continue
-        rel = p.relative_to(images_dir)
-        if rel.parts and rel.parts[0].lower() in ignore_folders:
-            continue
-        paths.append(p)
-    return paths
-
-
-def build_class_map(classes, normalize=True):
-    # Map normalized class name -> class index
-    if normalize:
-        return {c.strip().lower(): i for i, c in enumerate(classes)}
-    return {c: i for i, c in enumerate(classes)}
-
-
-def normalize_name(s: str):
-    return s.strip().lower().replace(" ", "").replace("-", "").replace("_", "")
+    print(f"📖 Found annotation file: {ann_file.name}")
+    data = {}
+    with open(ann_file, "r") as f:
+        for line in f:
+            parts = line.strip().split()
+            if len(parts) < 2: continue
+            img_name = parts[0]
+            # Expecting x1,y1,x2,y2,class
+            box_parts = [p.split(',') for p in parts[1:]]
+            boxes = []
+            for bp in box_parts:
+                if len(bp) == 5:
+                    boxes.append([float(x) for x in bp])
+            data[img_name] = boxes
+    return data
 
 
 def main():
-    p = argparse.ArgumentParser(description="Prepare YOLOv8/YOLOv11 dataset from a nested-folder image structure")
+    p = argparse.ArgumentParser(description="Prepare YOLO dataset with real boxes")
     p.add_argument("--dataset", default="data/dataset(tubes)", help="Root dataset folder")
     p.add_argument("--train-pct", type=float, default=0.9, help="Fraction of images to use for training")
-    p.add_argument("--seed", type=int, default=42, help="Random seed for splitting")
-    p.add_argument("--dry-run", action="store_true", help="Print actions but don\'t copy/write files")
-    p.add_argument("--default-class", default=None,
-                   help="Class name or id to use for images that don't match a folder; if omitted, skipped")
-    p.add_argument("--force", action="store_true", help="Regenerate labels even if they already exist")
-    p.add_argument("--balance", action="store_true", help="Oversample minority classes in the train split (helps with imbalance)")
-    p.add_argument("--balance-max-ratio", type=int, default=3, help="Max ratio between largest and smallest class after balancing")
+    p.add_argument("--seed", type=int, default=42, help="Random seed")
+    p.add_argument("--img-w", type=int, default=512, help="Original image width (for normalization)")
+    p.add_argument("--img-h", type=int, default=512, help="Original image height (for normalization)")
+    p.add_argument("--force", action="store_true", help="Regenerate labels")
     args = p.parse_args()
 
     base = Path(args.dataset).resolve()
@@ -70,62 +78,45 @@ def main():
 
     classes = load_classes(classes_file)
     class_map = build_class_map(classes)
-
-    # Allow a default fallback class by name or index
-    default_class_id = None
-    if args.default_class is not None:
-        if args.default_class.isdigit():
-            default_class_id = int(args.default_class)
-        else:
-            lookup = build_class_map(classes, normalize=False)
-            default_class_id = lookup.get(args.default_class)
-        if default_class_id is None or default_class_id < 0 or default_class_id >= len(classes):
-            raise SystemExit(f"❌ Invalid default class: {args.default_class}. Valid names: {classes}")
-
-    print(f"✅ Loaded {len(classes)} classes from {classes_file}")
-    if default_class_id is not None:
-        print(f"⚠️ Using default class id {default_class_id} ('{classes[default_class_id]}') for unmatched images")
+    
+    # Load real boxes if they exist
+    all_annotations = load_annotations(base)
+    if all_annotations:
+        print(f"🎯 Loaded boxes for {len(all_annotations)} images.")
 
     imgs = collect_image_paths(images_dir)
     if not imgs:
         raise SystemExit(f"❌ No images found under {images_dir}")
 
-    # Ensure label folder exists
     labels_dir.mkdir(parents=True, exist_ok=True)
 
     prepared = []
     for img in imgs:
         rel = img.relative_to(images_dir)
-        # Determine class from first directory component, if present
-        if len(rel.parents) > 1:
-            folder = rel.parts[0]
-        else:
-            folder = None
-
+        
+        # Priority 1: Use boxes from annotations file
+        boxes = all_annotations.get(img.name)
+        
         class_id = None
-        if folder:
-            normalized = normalize_name(folder)
-            # Try match by normalized string
-            for name, idx in class_map.items():
-                if normalize_name(name) == normalized:
-                    class_id = idx
-                    break
-
-        # Fallback: use default class if specified, else skip unclassified images
-        if class_id is None:
-            if default_class_id is not None:
-                class_id = default_class_id
-            else:
-                print(f"⚠️ Skipping {img.name}: unable to resolve class (folder='{folder}')")
-                continue
+        if not boxes:
+            # Priority 2: Try folder name
+            folder = rel.parts[0] if len(rel.parents) > 1 else None
+            if folder:
+                normalized = normalize_name(folder)
+                for name, idx in class_map.items():
+                    if normalize_name(name) == normalized:
+                        class_id = idx
+                        break
+        
+        # Skip if no class info at all
+        if boxes is None and class_id is None:
+            continue
 
         label_path = labels_dir / (img.stem + ".txt")
         if args.force or not label_path.exists():
-            if args.dry_run:
-                print(f"[dry] would create label for {img.name} -> class {class_id}")
-            else:
-                make_label_file(label_path, class_id)
-                print(f"Created label for {img.name}: class {class_id}")
+            # We assume image size is constant for normalization if using raw pixel coords
+            # Usually Roboflow exports are 640x640 or 512x512
+            make_label_file(label_path, class_id, boxes=boxes, img_w=args.img_w, img_h=args.img_h)
 
         prepared.append((img, label_path))
 
@@ -142,82 +133,27 @@ def main():
         dst_img.mkdir(parents=True, exist_ok=True)
         dst_lbl.mkdir(parents=True, exist_ok=True)
         for img_path, lbl_path in items:
-            dst_img_path = dst_img / img_path.name
-            dst_lbl_path = dst_lbl / lbl_path.name
-            if args.dry_run:
-                print(f"[dry] would copy {img_path} -> {dst_img_path}")
-                print(f"[dry] would copy {lbl_path} -> {dst_lbl_path}")
-            else:
-                from shutil import copy2
-                copy2(img_path, dst_img_path)
-                copy2(lbl_path, dst_lbl_path)
+            from shutil import copy2
+            copy2(img_path, dst_img / img_path.name)
+            copy2(lbl_path, dst_lbl / lbl_path.name)
 
-    print(f"Splitting {len(prepared)} images: {len(train)} train / {len(val)} val")
+    print(f"Splitting {len(prepared)}: {len(train)} train / {len(val)} val")
     copy_split(train, "train")
     copy_split(val, "val")
 
-    # Optionally balance classes by oversampling the train split
-    if args.balance:
-        from shutil import copy2
-        print("🧮 Balancing classes via oversampling in train split...")
-        train_lbl_dir = labels_dir / "train"
-        train_img_dir = images_dir / "train"
-
-        # Group by class
-        class_to_labels = {}
-        for label_file in train_lbl_dir.glob("*.txt"):
-            try:
-                cls = int(label_file.read_text().strip().split()[0])
-            except Exception:
-                continue
-            class_to_labels.setdefault(cls, []).append(label_file)
-
-        if not class_to_labels:
-            print("⚠️ No labels found in train split; skipping balancing")
-        else:
-            counts = {cls: len(files) for cls, files in class_to_labels.items()}
-            min_count = min(counts.values())
-            max_count = max(counts.values())
-            target = min(max_count, min_count * args.balance_max_ratio)
-            print(f"Class counts before balancing: {counts}")
-            print(f"Target per-class count (max ratio {args.balance_max_ratio}): {target}")
-
-            # Oversample to target
-            for cls, label_files in class_to_labels.items():
-                current = len(label_files)
-                if current >= target:
-                    continue
-                needed = target - current
-                for i in range(needed):
-                    src_label = random.choice(label_files)
-                    stem = src_label.stem
-                    # Find matching image by stem (any extension)
-                    candidates = list(train_img_dir.glob(f"{stem}.*"))
-                    if not candidates:
-                        continue
-                    src_img = candidates[0]
-                    dup_suffix = f"_dup{int(time.time()*1000)%100000}_{i}"
-                    dst_img = train_img_dir / f"{stem}{dup_suffix}{src_img.suffix}"
-                    dst_lbl = train_lbl_dir / f"{stem}{dup_suffix}.txt"
-                    if not args.dry_run:
-                        copy2(src_img, dst_img)
-                        copy2(src_label, dst_lbl)
-                        label_files.append(dst_lbl)
-            print("✅ Balancing complete.")
-
-    # Update data.yaml to point to new splits
+    # Update data.yaml
     yaml_text = f"path: {base.as_posix()}\ntrain: images/train\nval: images/val\n\nnames:\n"
     for i, name in enumerate(classes):
         yaml_text += f"  {i}: '{name}'\n"
+    with open(data_yaml, "w") as f:
+        f.write(yaml_text)
 
-    if args.dry_run:
-        print("[dry] would update data.yaml with:\n" + yaml_text)
-    else:
-        with open(data_yaml, "w", encoding="utf-8") as f:
-            f.write(yaml_text)
-        print(f"Updated {data_yaml}")
+    print("✅ Dataset prepared with actual boxes where available.")
 
-    print("✅ Dataset prepared (train/val split + labels).")
+
+if __name__ == "__main__":
+    main()
+
 
 
 if __name__ == "__main__":

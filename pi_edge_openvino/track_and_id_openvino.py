@@ -81,7 +81,7 @@ def load_valid_classes(data_dir: Path):
         return [line.strip().lower() for line in f.readlines() if line.strip()]
 
 
-def run_system(source_input, imgsz=320, min_conf=0.6, frame_skip=2, min_box_area=2000, nms_threshold=0.7, dedupe=False, debug=False, headless=False):
+def run_system(source_input, imgsz=320, min_conf=0.85, frame_skip=2, min_box_area=2000, max_box_area=None, nms_threshold=0.7, dedupe=False, debug=False, headless=False):
     base_dir = Path(__file__).resolve().parent.parent
 
     # ── Model paths (OpenVINO first priority here) ──
@@ -131,8 +131,13 @@ def run_system(source_input, imgsz=320, min_conf=0.6, frame_skip=2, min_box_area
     fps_counter = 0
     display_fps = 0.0
 
-    print("🎥 Camera Active. Press 'Q' to quit.")
-    print("⚡ Runtime: OpenVINO on ARM CPU")
+    # Calculate Max Area based on frame if not provided
+    # tubes shouldn't usually cover more than 70% of the frame
+    if max_box_area is None:
+        max_box_area = (imgsz * imgsz) * 0.7  # Default to 70% of inference size
+
+    print(f"🎥 Camera Active. Filter: {min_box_area} < Area < {max_box_area}")
+    print("Press 'Q' to quit.")
 
     while cap.isOpened():
         success, frame = cap.read()
@@ -144,15 +149,19 @@ def run_system(source_input, imgsz=320, min_conf=0.6, frame_skip=2, min_box_area
         if frame_count % frame_skip != 0:
             continue
 
+        h, w = frame.shape[:2]
         # Resize frame to reduce processing load
         small_frame = cv2.resize(frame, (imgsz, imgsz), interpolation=cv2.INTER_AREA)
 
-        # Inference (match imgsz to your exported model for best performance)
+        # Inference with tracking
         with torch.no_grad():
-            results = model.predict(small_frame, conf=min_conf, imgsz=imgsz, verbose=False)
+            results = model.track(small_frame, conf=min_conf, imgsz=imgsz, persist=True, verbose=False)
 
         detections = []
         if results[0].boxes is not None and len(results[0].boxes) > 0:
+            # Scale factor for boxes back to original frame size
+            scale_w, scale_h = w / imgsz, h / imgsz
+            
             boxes = results[0].boxes.xyxy.cpu().numpy()
             clss = results[0].boxes.cls.int().cpu().numpy()
             confs = results[0].boxes.conf.cpu().numpy()
@@ -162,7 +171,7 @@ def run_system(source_input, imgsz=320, min_conf=0.6, frame_skip=2, min_box_area
             else:
                 track_ids = np.full(len(boxes), -1, dtype=int)
 
-            # Build list for NMS (x, y, w, h)
+            # Build list for NMS (x, y, w, h) in inference coordinates
             bboxes_xywh = []
             for x1, y1, x2, y2 in boxes:
                 bboxes_xywh.append([int(x1), int(y1), int(x2 - x1), int(y2 - y1)])
@@ -171,7 +180,18 @@ def run_system(source_input, imgsz=320, min_conf=0.6, frame_skip=2, min_box_area
             idxs = idxs.flatten().tolist() if len(idxs) > 0 else []
 
             for idx in idxs:
-                x1, y1, x2, y2 = map(int, boxes[idx])
+                # Raw coordinates from inference
+                rx1, ry1, rx2, ry2 = boxes[idx]
+                
+                # Check area in inference space
+                area = (rx2 - rx1) * (ry2 - ry1)
+                if area < min_box_area or area > max_box_area:
+                    continue
+
+                # Project back to original frame size
+                x1, y1 = int(rx1 * scale_w), int(ry1 * scale_h)
+                x2, y2 = int(rx2 * scale_w), int(ry2 * scale_h)
+                
                 cls = int(clss[idx])
                 conf = float(confs[idx])
                 track_id = int(track_ids[idx])
@@ -181,37 +201,42 @@ def run_system(source_input, imgsz=320, min_conf=0.6, frame_skip=2, min_box_area
                 if brand_name not in valid_classes:
                     continue
 
-                # Filter: ignore very small boxes
-                area = max(0, (x2 - x1)) * max(0, (y2 - y1))
-                if area < min_box_area:
-                    continue
-
                 detections.append((brand_name, conf, (x1, y1, x2, y2), track_id))
 
                 if not headless:
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                    label_text = f"ID:{track_id} {brand_name}" if track_id != -1 else brand_name
-                    cv2.putText(frame, label_text, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    color = (0, 255, 0) # Green
+                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                    label_text = f"{brand_name} {conf:.2f}"
+                    if track_id != -1:
+                        label_text = f"#{track_id} {label_text}"
+                    cv2.putText(frame, label_text, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-                if debug:
-                    print(f"DEBUG: {brand_name} conf={conf:.2f} area={area} box={x1},{y1},{x2},{y2}")
+        # Persistence & Gap Logic
+        current_time = time.time()
+        if not hasattr(run_system, 'logged_ids'):
+            run_system.logged_ids = set()
+        if not hasattr(run_system, 'last_action_time'):
+            run_system.last_action_time = 0
 
-        if detections:
-            names = [d[0] for d in detections]
-            print(f"Detected: {', '.join(names)} | Total: {len(names)}")
+        # GLOBAL GAP: Check if enough time has passed since the LAST log of ANY object
+        # This prevents rapid-fire logging of multiple objects appearing at once
+        global_gap = 5.0 # 5 seconds gap after every detection
+        time_since_last_log = current_time - run_system.last_action_time
 
-            if dedupe:
-                for brand_name, conf, _, track_id in detections:
-                    key = (track_id, brand_name)
-                    if key in logged_objects:
-                        continue
-                    logged_objects.add(key)
+        if detections and time_since_last_log > global_gap:
+            for brand_name, conf, _, track_id in detections:
+                # 1. Tracked Object Logic (ONLY store if track_id exists)
+                if track_id != -1:
+                    if track_id in run_system.logged_ids:
+                        continue # Already logged this specific object
+                    
+                    run_system.logged_ids.add(track_id)
                     uuid_code = log_inspection(conn, track_id, brand_name, conf)
-                    print(f"📝 Logged to DB: {uuid_code} | {brand_name} ({conf:.2f})")
-            else:
-                for brand_name, conf, _, track_id in detections:
-                    uuid_code = log_inspection(conn, track_id, brand_name, conf)
-                    print(f"📝 Logged to DB: {uuid_code} | {brand_name} ({conf:.2f})")
+                    run_system.last_action_time = current_time
+                    print(f"📝 [LOGGED] {brand_name} (ID:{track_id}). UUID: {uuid_code}. Next log available in {global_gap}s")
+                    break # Log only ONE thing per gap interval
+                
+                # If track_id == -1, we skip logging as per requirements
 
         # FPS counter
         fps_counter += 1
@@ -221,13 +246,23 @@ def run_system(source_input, imgsz=320, min_conf=0.6, frame_skip=2, min_box_area
             fps_counter = 0
             fps_start = time.time()
 
-        cv2.putText(frame, f"OpenVINO FPS: {display_fps:.1f}", (10, 30),
-                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+        # Overlay global info
+        cv2.rectangle(frame, (0, 0), (220, 60), (0, 0, 0), -1)
+        cv2.putText(frame, f"FPS: {display_fps:.1f}", (10, 25),
+                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        cv2.putText(frame, f"THR: {min_conf:.2f}", (10, 50),
+                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         if not headless:
             cv2.imshow("ML Brand Detector [OpenVINO]", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
                 break
+            # Real-time tuning keys
+            elif key == ord('+'):
+                min_conf = min(0.95, min_conf + 0.05)
+            elif key == ord('-'):
+                min_conf = max(0.1, min_conf - 0.05)
         else:
             if frame_count % 20 == 0:
                 print(f"⚡ OpenVINO FPS: {display_fps:.1f}")
@@ -241,14 +276,15 @@ def run_system(source_input, imgsz=320, min_conf=0.6, frame_skip=2, min_box_area
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=str, default="0", help="Camera ID (0) or video path")
-    parser.add_argument("--imgsz", type=int, default=320, help="Size for inference (smaller = faster)")
-    parser.add_argument("--min-conf", type=float, default=0.6, help="Minimum confidence to accept a detection")
-    parser.add_argument("--min-area", type=int, default=2000, help="Minimum box area to accept a detection")
-    parser.add_argument("--nms-thresh", type=float, default=0.7, help="Non-max suppression IoU threshold")
-    parser.add_argument("--skip", type=int, default=2, help="Skip every Nth frame (higher = faster)")
-    parser.add_argument("--dedupe", action="store_true", help="Log each unique (track_id,class) only once")
-    parser.add_argument("--debug", action="store_true", help="Print debug info for each detection")
-    parser.add_argument("--headless", action="store_true", help="Run without GUI (for SSH/Pi)")
+    parser.add_argument("--imgsz", type=int, default=320, help="Size for inference")
+    parser.add_argument("--min-conf", type=float, default=0.85, help="Min confidence")
+    parser.add_argument("--min-area", type=int, default=1500, help="Min area")
+    parser.add_argument("--max-area", type=int, default=None, help="Max area (filters faces/big objects)")
+    parser.add_argument("--nms-thresh", type=float, default=0.7, help="NMS threshold")
+    parser.add_argument("--skip", type=int, default=2, help="Skip every Nth frame")
+    parser.add_argument("--dedupe", action="store_true", help="Log unique track_id once")
+    parser.add_argument("--debug", action="store_true", help="Print debug info")
+    parser.add_argument("--headless", action="store_true", help="Run without GUI")
     args = parser.parse_args()
     run_system(
         args.source,
@@ -256,8 +292,10 @@ if __name__ == '__main__':
         min_conf=args.min_conf,
         frame_skip=args.skip,
         min_box_area=args.min_area,
+        max_box_area=args.max_area,
         nms_threshold=args.nms_thresh,
         dedupe=args.dedupe,
         debug=args.debug,
         headless=args.headless,
     )
+
