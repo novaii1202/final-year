@@ -2,10 +2,14 @@ from fastapi import FastAPI, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 import sqlite3
 import asyncio
+import os
 from pathlib import Path
 import json
 
 app = FastAPI()
+
+# Optional: set PUBLISHED_URL or TUNNEL_URL to your localtunnel (or ngrok) URL for linking
+TUNNEL_URL = os.environ.get("PUBLISHED_URL") or os.environ.get("TUNNEL_URL", "")
 
 app.add_middleware(
     CORSMiddleware,
@@ -41,6 +45,17 @@ def get_stats():
             print("DB read error:", e)
             
     return {"total_tubs": total_tubs, "company_counts": company_counts}
+
+@app.get("/api/info")
+def api_info():
+    """Public URL and endpoints info (link API with tunnel)."""
+    return {
+        "local_url": "http://localhost:8001",
+        "tunnel_url": TUNNEL_URL or None,
+        "docs": "http://localhost:8001/docs",
+        "stats": "/api/stats",
+        "ws_stats": "ws://localhost:8001/ws/stats",
+    }
 
 @app.get("/api/stats")
 def read_stats():

@@ -115,7 +115,7 @@ def load_valid_classes(data_dir: Path):
 # ─────────────────────────────────────────────────────
 def run_system(source_input,
                imgsz=320,
-               min_conf=0.85,
+               min_conf=0.9,
                frame_skip=2,
                min_box_area=4000,
                nms_threshold=0.7,
@@ -125,10 +125,16 @@ def run_system(source_input,
 
     base_dir = Path(__file__).resolve().parent.parent
 
-    onnx_model_path = base_dir / "runs/detect/brand_experiment32/weights/best.onnx"
-    ncnn_model_path = base_dir / "runs/detect/brand_experiment32/weights/best_ncnn_model"
-    tflite_model_path = base_dir / "runs/detect/brand_experiment32/weights/best_saved_model/best_float32.tflite"
-    pt_model_path = base_dir / "runs/detect/brand_experiment32/weights/best.pt"
+    # Use the latest trained weights from brand_experiment3
+    onnx_model_path = base_dir / "runs/detect/brand_experiment3/weights/best.onnx"
+    ncnn_model_path = base_dir / "runs/detect/brand_experiment3/weights/best_ncnn_model"
+    tflite_model_path = base_dir / "runs/detect/brand_experiment3/weights/best_saved_model/best_float32.tflite"
+    pt_model_path = base_dir / "runs/detect/brand_experiment3/weights/best.pt"
+
+    # Clamp to a high-confidence operating point
+    if min_conf < 0.9:
+        print(f"🔧 Bumping min_conf from {min_conf:.2f} to 0.90 for high-confidence tube-only detections.")
+        min_conf = 0.9
 
     # ───── Load model ─────
     if onnx_model_path.exists():
@@ -148,8 +154,10 @@ def run_system(source_input,
         model = YOLO(str(pt_model_path))
 
     else:
-        print("⚠️ Using default YOLO")
-        model = YOLO("yolo11n.pt")
+        raise RuntimeError(
+            "No trained tube-detection model found in runs/detect/brand_experiment3/weights.\n"
+            "Please place your latest best.pt / ONNX / NCNN / TFLite weights there and retry."
+        )
 
     # ───── Load valid classes ─────
     valid_classes = load_valid_classes(base_dir / "data" / "dataset(tubes)")
@@ -181,6 +189,7 @@ def run_system(source_input,
         cap = cv2.VideoCapture(source_input)
 
     logged_objects = set()
+    total_tubes_logged = 0  # running count: +1 each time a tube is logged to DB
 
     frame_count = 0
 
@@ -276,9 +285,6 @@ def run_system(source_input,
             track_ids = [d[3] for d in detections]
 
             unique_ids = {tid for tid in track_ids if tid != -1}
-            total_tubes = len(unique_ids) if unique_ids else len(detections)
-
-            print(f"Detected Tube: {', '.join(names)} | Total tubes: {total_tubes}")
 
             for brand_name, conf, _, track_id in detections:
 
@@ -294,6 +300,7 @@ def run_system(source_input,
                     logged_objects.add(key)
 
                 uuid_code = log_inspection(conn, track_id, brand_name, conf)
+                total_tubes_logged += 1
 
                 # Append to plain-text log so every detection is recorded
                 timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -305,6 +312,7 @@ def run_system(source_input,
                     pass
 
                 print(f"Logged to DB and file: {brand_name} | Confidence: {conf:.2f}")
+            print(f"Detected Tube: {', '.join(names)} | Total tubes: {total_tubes_logged}")
 
         # ───── FPS counter ─────
         fps_counter += 1

@@ -1,5 +1,6 @@
 import cv2
 import argparse
+import sys
 import uuid
 import datetime
 import sqlite3
@@ -11,6 +12,10 @@ import numpy as np
 import torch
 from ultralytics import YOLO
 
+# On Windows, use DirectShow so camera indices match external vs built-in (often 0 = laptop, 1 = USB external)
+IS_WIN = sys.platform == "win32"
+CAP_BACKEND = cv2.CAP_DSHOW if IS_WIN else cv2.CAP_ANY
+
 # ───────────────────────────────────────────────────────────────────
 # OpenVINO-optimized inference for Raspberry Pi 4
 # Intel OpenVINO now supports ARM CPUs via pip wheels.
@@ -19,8 +24,11 @@ from ultralytics import YOLO
 
 class VideoCaptureAsync:
     """Threaded video capture — keeps frame grabbing off the inference thread."""
-    def __init__(self, source):
-        self.cap = cv2.VideoCapture(source)
+    def __init__(self, source, backend=None):
+        if backend is not None and isinstance(source, int):
+            self.cap = cv2.VideoCapture(source, backend)
+        else:
+            self.cap = cv2.VideoCapture(source)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
@@ -81,21 +89,29 @@ def load_valid_classes(data_dir: Path):
         return [line.strip().lower() for line in f.readlines() if line.strip()]
 
 
-def run_system(source_input, imgsz=320, min_conf=0.85, frame_skip=2, min_box_area=2000, max_box_area=None, nms_threshold=0.7, dedupe=False, debug=False, headless=False):
+def run_system(source_input, imgsz=320, min_conf=0.9, frame_skip=2, min_box_area=2000, max_box_area=None, nms_threshold=0.7, dedupe=False, debug=False, headless=False):
     base_dir = Path(__file__).resolve().parent.parent
 
-    # ── Model paths (OpenVINO first priority here) ──
+    # ── Model paths (OpenVINO first priority when installed) ──
     openvino_model_path = base_dir / "runs/detect/brand_experiment32/weights/best_openvino_model"
     onnx_model_path = base_dir / "runs/detect/brand_experiment32/weights/best.onnx"
     ncnn_model_path = base_dir / "runs/detect/brand_experiment32/weights/best_ncnn_model"
     pt_model_path = base_dir / "runs/detect/brand_experiment32/weights/best.pt"
 
-    # ── Load Model (OpenVINO preferred) ──
-    if openvino_model_path.exists():
+    try:
+        import openvino as ov  # noqa: F401
+        has_openvino = True
+    except ImportError:
+        has_openvino = False
+
+    # ── Load Model (OpenVINO preferred when available, else ONNX/PT) ──
+    if has_openvino and openvino_model_path.exists():
         print(f"🚀 Loading OpenVINO model (320x320): {openvino_model_path}")
         model = YOLO(str(openvino_model_path), task='detect')
     elif onnx_model_path.exists():
-        print(f"🔄 Falling back to ONNX model: {onnx_model_path}")
+        if not has_openvino and openvino_model_path.exists():
+            print("ℹ️ OpenVINO not installed — using ONNX (install with: pip install openvino)")
+        print(f"🔄 Loading ONNX model: {onnx_model_path}")
         model = YOLO(str(onnx_model_path), task='detect')
     elif ncnn_model_path.exists():
         print(f"🔄 Falling back to NCNN model: {ncnn_model_path}")
@@ -104,8 +120,10 @@ def run_system(source_input, imgsz=320, min_conf=0.85, frame_skip=2, min_box_are
         print(f"🔄 Falling back to PyTorch model: {pt_model_path}")
         model = YOLO(str(pt_model_path))
     else:
-        print("⚠️ No custom model found! Using standard YOLOv11n.")
-        model = YOLO("yolo11n.pt")
+        raise RuntimeError(
+            "No trained tube-detection model found in runs/detect/brand_experiment32/weights.\n"
+            "Please place your latest best.pt / ONNX / NCNN / OpenVINO weights there and retry."
+        )
 
     valid_classes = load_valid_classes(base_dir / "data" / "dataset(tubes)")
     if not valid_classes:
@@ -115,10 +133,12 @@ def run_system(source_input, imgsz=320, min_conf=0.85, frame_skip=2, min_box_are
     db_path.parent.mkdir(parents=True, exist_ok=True)
     conn = setup_db(db_path)
 
-    # ── Video capture ──
+    # ── Video capture (Windows: use DirectShow so index 1 = external USB, 0 = laptop) ──
     if source_input.isnumeric():
         source_input = int(source_input)
-        cap = VideoCaptureAsync(source_input)
+        cap = VideoCaptureAsync(source_input, backend=CAP_BACKEND if IS_WIN else None)
+        if IS_WIN:
+            print("📹 Using DirectShow backend (Windows) — index 1 = external camera")
         print("📹 Using threaded video capture for max FPS")
     else:
         cap = cv2.VideoCapture(source_input)
@@ -273,9 +293,26 @@ def run_system(source_input, imgsz=320, min_conf=0.85, frame_skip=2, min_box_are
     conn.close()
     print(f"\n✅ Session complete. Final FPS: {display_fps:.1f}")
 
+def list_cameras(max_to_try=4):
+    """Print which camera indices are available (Windows: uses DirectShow)."""
+    backend = cv2.CAP_DSHOW if IS_WIN else cv2.CAP_ANY
+    print("Checking camera indices (use the one that shows your external camera):")
+    for i in range(max_to_try):
+        cap = cv2.VideoCapture(i, backend if IS_WIN else cv2.CAP_ANY)
+        if cap.isOpened():
+            ret, _ = cap.read()
+            cap.release()
+            status = "OK" if ret else "opens but no frame"
+            print(f"  --source {i}  ({status})")
+        else:
+            print(f"  --source {i}  (not available)")
+    if IS_WIN:
+        print("(Using DirectShow backend on Windows)")
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--source", type=str, default="0", help="Camera ID (0) or video path")
+    parser.add_argument("--list-cameras", action="store_true", help="List available camera indices then exit")
     parser.add_argument("--imgsz", type=int, default=320, help="Size for inference")
     parser.add_argument("--min-conf", type=float, default=0.85, help="Min confidence")
     parser.add_argument("--min-area", type=int, default=1500, help="Min area")
@@ -286,6 +323,9 @@ if __name__ == '__main__':
     parser.add_argument("--debug", action="store_true", help="Print debug info")
     parser.add_argument("--headless", action="store_true", help="Run without GUI")
     args = parser.parse_args()
+    if args.list_cameras:
+        list_cameras()
+        sys.exit(0)
     run_system(
         args.source,
         imgsz=args.imgsz,
